@@ -1,0 +1,202 @@
+#!/bin/bash
+
+#
+# Print the smallest graph which spans several refs
+#
+
+function usage {
+    echo 'Print the shared history of git refs';
+    echo '';
+    echo 'git graph <ref> <ref> ...     # Pass several refs to graph';
+    echo 'git graph ... -- <path>       # Filter commits which affected <path>';
+    echo 'git graph --single-parent ... # Pass options know to git log';
+    echo 'git graph --echo ...          # Just print the underlying git command';
+    echo 'git graph --bash-completion   # Print bash completion code';
+    echo 'git graph --help              # Print this message';
+}
+
+function main {
+    local REFS FLAGS FILES;
+    local ECHO_GIT_COMMAND=0; # false
+    FLAGS=(
+        '--graph' \
+        '--oneline' \
+        '--format=format:%C(auto)%h%C(reset)%C(auto)%d%C(reset) %C(auto)%<(50,trunc)%s %C(reset)'
+    );
+
+    if [[ "$#" -eq 0 ]]; then
+        usage;
+        return 0;
+    fi
+
+    # Parse arguments
+    while [ "$#" -gt 0 ]; do
+        if [ "$1" == '--help' ]; then
+            usage;
+            exit 0;
+        elif [ "$1" == '--bash-completion' ]; then
+             print_bash_completion;
+             exit 0;
+        elif [ "$1" == '--echo' ]; then
+            ECHO_GIT_COMMAND=1;
+        elif [ "$1" == '--' ]; then
+            FILES+=( "$@" );
+            break;
+        elif [[ "$1" =~ ^- ]]; then
+            FLAGS+=( "$1" );
+        else
+            REFS+=( "$1" );
+        fi
+        shift;
+    done;
+
+    if [ "${#REFS[@]}" -eq 0 ]; then
+        echo "Err! 1 or more refs required" >&2;
+        usage >&2;
+        return 1;
+    fi
+
+    # If only one ref is passed, make this invocation equivalent to:
+    # `git graph <ref> HEAD`
+    if [ "${#REFS[@]}" -eq 1 ]; then
+        REFS+=( HEAD );
+    fi
+
+    # Validate the refs
+    for ref in "${REFS[@]}"; do
+        git rev-parse --verify "$ref" &> /dev/null
+        if [ "$?" -ne 0 ]; then
+           echo "Err! this is an invalid ref: $ref" >&2;
+           exit 1;
+        fi;
+    done;
+
+
+    local COMMON_ANCESTOR=$(common-ancestor "${REFS[@]}");
+    local NEGATION_SET;
+
+    # Only compute negation set, if the common ancestor exists
+    if [ -n "$COMMON_ANCESTOR" ]; then
+        NEGATION_SET=( "$COMMON_ANCESTOR^!" )
+    fi
+
+    local COMMAND=( git log "${FLAGS[@]}" "${NEGATION_SET[@]}" "${REFS[@]}" -- "${FILES[@]}" );
+    if [ "$ECHO_GIT_COMMAND" -eq 1 ]; then
+        echo_args "${COMMAND[@]}"
+    else
+       "${COMMAND[@]}";
+    fi
+}
+
+# For a series of refs passed as arguments find the first common ancestor
+function common-ancestor {
+    local COMMON_ANCESTOR="" extended_endpoints endpoint endpoint1 endpoint2;
+
+    # This algorithm produces a set of paths from from every ref to the root
+    # commmit. A path here is defined as an ancestry path (child, parent,
+    # grandparent, etc). A commit with multiple parents (a merge), is
+    # represented via muliple paths. The algorithm starts at the oldest
+    # commit of every path, the root. Every commit here should be the same if
+    # all refs share the same root, then it checks if the next commits are all the
+    # same iterating until a path features a commit that is not shared by the
+    # others. The ancestor of this diverger is the common ancestor to all
+    # paths.
+
+    # To generate a path, we leverage `git rev-list --first-parent $ref` which
+    # produces a path from $ref to its root. Using this command with all the
+    # refs passed as arguments would yield an incomplete set of paths, since
+    # --first-parent ignores the other parents in every merge. Thus we take
+    # all refs, and all the other (2,3,4th etc) parents of all merges along
+    # the refs to produce a grand list of refs whose paths we compute.
+
+    # Assumes that the args are valid refs
+    # Normalizes all refs to shas and ensures uniqueness of the shas. In the
+    # next step we have to take each ref and find all merges found in that ref's
+    # history not found in any other refs history. This means listing the merges
+    # and negating all ancestors of all other refs.
+    # I.e. git rev-list --merges ref1 ^ref2 ^ref3 etc. However if ref2 and ref1
+    # refer to the same commit, that would be asking for all ref1 merges and
+    # no ref1 merges at the same time.
+    local normalized_endpoints=(
+      $(
+        for endpoint in "$@"; do
+            git rev-parse "$endpoint"
+        done | sort -u
+      )
+    )
+
+    extended_endpoints=( ${normalized_endpoints[@]} )
+    for e1 in "${normalized_endpoints[@]}"; do
+      negation_set=()
+      for e2 in "${normalized_endpoints[@]}"; do
+        if [ "$e2" != "$e1" ]; then
+          negation_set+=( "^$e2" )
+        fi
+      done
+      extended_endpoints+=(
+        $(
+          git rev-list --merges ${negation_set[@]} $e1 | while read merge; do
+            git log -n1 "$merge" --format="%P" | tr ' ' '\n'
+          done
+        )
+      )
+    done
+
+    # Ideally we would read a commit off every path check for equality and
+    # continue, but we can instead take two paths at a time, find their common
+    # ancestor, and then find the common ancestor of the previous go and the
+    # third path, etc. until we reduce to a single common ancestor
+    # I.e c-a(c-a(c-a($1, $2), $3), ...)
+    local index=0
+    endpoint1="${extended_endpoints[$index]}";
+    while [[ $((index + 1)) -lt "${#extended_endpoints[@]}" ]]; do
+        index=$((index + 1))
+        endpoint2="${extended_endpoints[$index]}";
+
+        while read sha1 <&3  && read sha2 <&4
+        do
+            if [ "$sha1" == "$sha2" ]; then
+                COMMON_ANCESTOR="$sha1";
+            else
+                # Break at the first occurence where the history diverged
+                break;
+            fi;
+
+        done 3< <(git rev-list --reverse --first-parent "$endpoint1" --) 4< <(git rev-list --reverse  --first-parent "$endpoint2" -- )
+
+        # When comparing the two histories from their starts, we never found
+        # a branching off point
+        if [ -z "$COMMON_ANCESTOR" ]; then
+            return 1;
+        fi;
+
+        endpoint1="$COMMON_ANCESTOR";
+    done
+
+    echo "$COMMON_ANCESTOR";
+}
+
+# Print quoted arguments
+function echo_args {
+    while [ "$#" -gt 1 ]; do
+        printf "%q " "$1";
+        shift;
+    done;
+    if [ "$#" -eq 1 ]; then
+        printf "%q" "$1";
+        echo;
+    fi;
+}
+
+function print_bash_completion {
+  cat <<'EOF'
+# Source me, so that git graph support git completion!
+# Requires git bash completion.
+function git_graph
+{
+      __gitcomp_nl "$(__git_refs)"
+}
+EOF
+}
+
+main $@;
