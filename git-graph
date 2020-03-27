@@ -199,4 +199,4 @@ function git_graph
 EOF
 }
 
-main $@;
+main "$@";
